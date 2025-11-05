@@ -15,9 +15,12 @@ from PyQt5.QtGui import QColor
 
 # ===================== 影片播放器 =====================
 class VideoSegmentPlayer:
-    def __init__(self, video_path, num_segments=10):
+    def __init__(self, video_path, segment_frames):
+        """
+        segment_frames: [(start_frame, end_frame), ...]
+        """
         self.video_path = video_path
-        self.num_segments = num_segments
+        self.segment_frames = segment_frames
         self.cap = cv2.VideoCapture(video_path)
         
         if not self.cap.isOpened():
@@ -25,7 +28,6 @@ class VideoSegmentPlayer:
         
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.frames_per_segment = self.total_frames // num_segments
         
         self.current_segment = 1
         self.playing = False
@@ -33,15 +35,15 @@ class VideoSegmentPlayer:
         self.window_name = 'Color Controlled Video Player'
         
         print(f"影片載入: 總幀數 {self.total_frames}, FPS {self.fps}")
-        print(f"片段數: {self.num_segments}, 每段 {self.frames_per_segment} 幀")
+        print(f"片段設定: {segment_frames}")
     
     def jump_to(self, segment_num):
-        if segment_num < 1 or segment_num > self.num_segments:
+        if segment_num < 1 or segment_num > len(self.segment_frames):
             return False
-        start_frame = (segment_num - 1) * self.frames_per_segment
+        start_frame, _ = self.segment_frames[segment_num - 1]
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         self.current_segment = segment_num
-        print(f">>> 跳轉到第 {segment_num} 段")
+        print(f">>> 跳轉到第 {segment_num} 段 (幀 {start_frame})")
         return True
     
     def start_playing(self):
@@ -69,9 +71,17 @@ class VideoSegmentPlayer:
                 continue
             
             current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            current_seg = min((current_frame // self.frames_per_segment) + 1, self.num_segments)
             
-            text = f"Segment: {current_seg}/{self.num_segments} | Frame: {current_frame}/{self.total_frames}"
+            # 檢查是否需要跳到下一段
+            start_frame, end_frame = self.segment_frames[self.current_segment - 1]
+            if current_frame >= end_frame:
+                next_segment = self.current_segment + 1
+                if next_segment > len(self.segment_frames):
+                    next_segment = 1
+                self.jump_to(next_segment)
+                continue
+            
+            text = f"Segment: {self.current_segment}/{len(self.segment_frames)} | Frame: {current_frame}/{self.total_frames}"
             cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                        1, (0, 255, 0), 2, cv2.LINE_AA)
             
@@ -98,11 +108,12 @@ class ADBController(QWidget):
         self.video_player = None
         self.segment_colors = []  # [(r, g, b, tolerance), ...]
         self.color_detection_active = False
+        self.video_path = None
         self.initUI()
 
     def initUI(self):
         self.setWindowTitle('ADB 控制面板 + 顏色影片控制')
-        self.setGeometry(100, 100, 600, 700)
+        self.setGeometry(100, 100, 650, 750)
 
         main_layout = QVBoxLayout()
 
@@ -173,7 +184,7 @@ class ADBController(QWidget):
         main_layout.addWidget(video_group)
 
         # ==================== 片段顏色設定區 ====================
-        self.segment_color_group = QGroupBox("片段顏色設定")
+        self.segment_color_group = QGroupBox("片段顏色與起始幀設定")
         self.segment_color_layout = QVBoxLayout()
         
         # 使用 ScrollArea 以防片段太多
@@ -204,6 +215,11 @@ class ADBController(QWidget):
         self.btn_start_detection.setEnabled(False)
         control_layout.addWidget(self.btn_start_detection)
 
+        self.btn_stop_detection = QPushButton('⏸ 停止偵測')
+        self.btn_stop_detection.clicked.connect(self.stop_detection)
+        self.btn_stop_detection.setEnabled(False)
+        control_layout.addWidget(self.btn_stop_detection)
+
         self.btn_stop = QPushButton('⏹ 全部停止')
         self.btn_stop.clicked.connect(self.stop_all)
         control_layout.addWidget(self.btn_stop)
@@ -216,14 +232,15 @@ class ADBController(QWidget):
 
         self.setLayout(main_layout)
 
-    # ==================== 即時取色 ====================
+    # ==================== 即時取色 (修正色偏) ====================
     def update_mouse_color(self):
         try:
             x, y = pyautogui.position()
             with mss.mss() as sct:
                 monitor = {"top": y, "left": x, "width": 1, "height": 1}
                 img = np.array(sct.grab(monitor))
-                r, g, b = img[0, 0, :3]
+                # 修正: mss 捕獲的是 BGRA 格式，需要轉換為 RGB
+                b, g, r = img[0, 0, :3]
             
             self.color_label.setText(f"滑鼠位置 ({x}, {y}) 顏色: RGB({r}, {g}, {b})")
             self.color_label.setStyleSheet(
@@ -233,8 +250,19 @@ class ADBController(QWidget):
         except Exception as e:
             pass
 
-    # ==================== 片段顏色設定 ====================
+    # ==================== 片段顏色設定 (優化) ====================
     def update_segment_inputs(self):
+        # 儲存舊設定
+        old_settings = []
+        for widgets in self.segment_input_widgets:
+            old_settings.append({
+                'r': widgets[2].value(),
+                'g': widgets[3].value(),
+                'b': widgets[4].value(),
+                'tolerance': widgets[5].value(),
+                'start_frame': widgets[6].value()
+            })
+        
         # 清除舊的輸入欄位
         for widget_group in self.segment_input_widgets:
             for widget in widget_group:
@@ -243,51 +271,73 @@ class ADBController(QWidget):
         
         num_segments = self.segment_spinbox.value()
         
+        # 計算每段的預設幀數範圍
+        if self.video_player:
+            frames_per_segment = self.video_player.total_frames // num_segments
+        else:
+            frames_per_segment = 1000
+        
         # 為每個片段創建顏色輸入欄位
         for i in range(num_segments):
-            segment_layout = QHBoxLayout()
+            segment_layout = QVBoxLayout()
+            row1 = QHBoxLayout()
+            row2 = QHBoxLayout()
             
-            label = QLabel(f"片段 {i+1}:")
-            segment_layout.addWidget(label)
+            label = QLabel(f"<b>片段 {i+1}</b>")
+            row1.addWidget(label)
             
             # 複製按鈕（使用當前滑鼠顏色）
-            btn_copy = QPushButton('📋 複製當前顏色')
+            btn_copy = QPushButton('📋 點擊擷取顏色')
             btn_copy.clicked.connect(lambda checked, idx=i: self.copy_current_color(idx))
-            segment_layout.addWidget(btn_copy)
+            row1.addWidget(btn_copy)
             
-            segment_layout.addWidget(QLabel("R:"))
+            row1.addWidget(QLabel("R:"))
             r_input = QSpinBox()
             r_input.setMaximum(255)
-            r_input.setValue(0)
-            segment_layout.addWidget(r_input)
+            r_input.setValue(old_settings[i]['r'] if i < len(old_settings) else 0)
+            row1.addWidget(r_input)
             
-            segment_layout.addWidget(QLabel("G:"))
+            row1.addWidget(QLabel("G:"))
             g_input = QSpinBox()
             g_input.setMaximum(255)
-            g_input.setValue(0)
-            segment_layout.addWidget(g_input)
+            g_input.setValue(old_settings[i]['g'] if i < len(old_settings) else 0)
+            row1.addWidget(g_input)
             
-            segment_layout.addWidget(QLabel("B:"))
+            row1.addWidget(QLabel("B:"))
             b_input = QSpinBox()
             b_input.setMaximum(255)
-            b_input.setValue(0)
-            segment_layout.addWidget(b_input)
+            b_input.setValue(old_settings[i]['b'] if i < len(old_settings) else 0)
+            row1.addWidget(b_input)
             
-            segment_layout.addWidget(QLabel("容差:"))
+            row1.addWidget(QLabel("容差:"))
             tolerance_input = QSpinBox()
             tolerance_input.setMaximum(100)
-            tolerance_input.setValue(30)
-            segment_layout.addWidget(tolerance_input)
+            tolerance_input.setValue(old_settings[i]['tolerance'] if i < len(old_settings) else 30)
+            row1.addWidget(tolerance_input)
+            
+            # 第二行：起始幀設定
+            row2.addWidget(QLabel(f"  ↳ 起始幀:"))
+            start_frame_input = QSpinBox()
+            start_frame_input.setMaximum(999999)
+            start_frame_input.setValue(
+                old_settings[i]['start_frame'] if i < len(old_settings) 
+                else i * frames_per_segment
+            )
+            row2.addWidget(start_frame_input)
+            row2.addWidget(QLabel(f"(建議: {i * frames_per_segment})"))
+            row2.addStretch()
+            
+            segment_layout.addLayout(row1)
+            segment_layout.addLayout(row2)
             
             self.segment_inputs_layout.addLayout(segment_layout)
-            self.segment_input_widgets.append([label, btn_copy, r_input, g_input, b_input, tolerance_input])
+            self.segment_input_widgets.append([label, btn_copy, r_input, g_input, b_input, tolerance_input, start_frame_input])
 
     def copy_current_color(self, segment_index):
         """按下後，等待使用者點擊螢幕任一位置，然後自動擷取該點顏色"""
-        import pyautogui
         from pynput import mouse
 
-        self.status_label.setText(f"狀態: 🖱 請點擊螢幕任一位置以擷取顏色...")
+        self.status_label.setText(f"狀態: 🖱 請點擊螢幕任一位置以擷取顏色 (片段 {segment_index + 1})...")
 
         def on_click(x, y, button, pressed):
             if pressed:
@@ -295,12 +345,13 @@ class ADBController(QWidget):
                     with mss.mss() as sct:
                         monitor = {"top": int(y), "left": int(x), "width": 1, "height": 1}
                         img = np.array(sct.grab(monitor))
-                        r, g, b = img[0, 0, :3]
+                        # 修正色偏: mss 是 BGRA 格式
+                        b, g, r = img[0, 0, :3]
 
                     widgets = self.segment_input_widgets[segment_index]
-                    widgets[2].setValue(r)
-                    widgets[3].setValue(g)
-                    widgets[4].setValue(b)
+                    widgets[2].setValue(int(r))
+                    widgets[3].setValue(int(g))
+                    widgets[4].setValue(int(b))
 
                     print(f"片段 {segment_index+1} 擷取顏色: RGB({r},{g},{b})")
                     self.status_label.setText(
@@ -345,25 +396,57 @@ class ADBController(QWidget):
             self, "選擇影片", "", "Video Files (*.mp4 *.avi *.mkv *.mov)"
         )
         if file_path:
+            self.video_path = file_path
             try:
-                num_segments = self.segment_spinbox.value()
-                self.video_player = VideoSegmentPlayer(file_path, num_segments)
+                # 暫時載入以取得影片資訊
+                cap = cv2.VideoCapture(file_path)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.release()
+                
                 self.video_info_label.setText(
-                    f"✅ 已載入 | 片段數: {num_segments} | FPS: {self.video_player.fps:.1f}"
+                    f"✅ 已載入 | 總幀數: {total_frames} | FPS: {fps:.1f} | 請設定片段後再播放"
                 )
                 self.btn_start_video.setEnabled(True)
                 self.btn_start_detection.setEnabled(True)
+                
+                # 更新片段輸入的建議值
+                self.update_segment_inputs()
+                
             except Exception as e:
                 self.video_info_label.setText(f"❌ 載入失敗: {e}")
 
     def start_video(self):
-        if self.video_player:
+        if not self.video_path:
+            self.status_label.setText("狀態: ❌ 請先載入影片")
+            return
+        
+        # 讀取片段設定
+        segment_frames = []
+        for i, widgets in enumerate(self.segment_input_widgets):
+            start_frame = widgets[6].value()
+            if i < len(self.segment_input_widgets) - 1:
+                end_frame = self.segment_input_widgets[i + 1][6].value()
+            else:
+                # 最後一段到影片結尾
+                cap = cv2.VideoCapture(self.video_path)
+                end_frame = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                cap.release()
+            segment_frames.append((start_frame, end_frame))
+        
+        try:
+            if self.video_player:
+                self.video_player.cleanup()
+            
+            self.video_player = VideoSegmentPlayer(self.video_path, segment_frames)
             self.video_player.start_playing()
             self.status_label.setText("狀態: ▶ 影片播放中")
+        except Exception as e:
+            self.status_label.setText(f"狀態: ❌ 播放失敗: {e}")
 
     def start_color_detection(self):
-        if not self.video_player:
-            print("請先載入影片")
+        if not self.video_player or not self.video_player.playing:
+            self.status_label.setText("狀態: ❌ 請先開始播放影片")
             return
         
         # 讀取所有片段的顏色設定
@@ -378,19 +461,35 @@ class ADBController(QWidget):
         print(f"已載入 {len(self.segment_colors)} 個片段顏色設定")
         
         self.color_detection_active = True
+        self.btn_start_detection.setEnabled(False)
+        self.btn_stop_detection.setEnabled(True)
         self.status_label.setText("狀態: 🎯 顏色偵測中...")
         
+        # 每秒 5 幀 = 每 200ms 偵測一次
         self.detection_timer = QTimer()
         self.detection_timer.timeout.connect(self.check_color_and_control)
-        self.detection_timer.start(100)
+        self.detection_timer.start(200)
+
+    def stop_detection(self):
+        self.color_detection_active = False
+        if hasattr(self, 'detection_timer'):
+            self.detection_timer.stop()
+        
+        self.btn_start_detection.setEnabled(True)
+        self.btn_stop_detection.setEnabled(False)
+        self.status_label.setText("狀態: ⏸ 偵測已停止")
 
     def check_color_and_control(self):
+        if not self.color_detection_active:
+            return
+            
         try:
             x, y = pyautogui.position()
             with mss.mss() as sct:
                 monitor = {"top": y, "left": x, "width": 1, "height": 1}
                 img = np.array(sct.grab(monitor))
-                current_r, current_g, current_b = img[0, 0, :3]
+                # 修正色偏
+                current_b, current_g, current_r = img[0, 0, :3]
 
             # 檢查每個片段的顏色
             for segment_num, (r, g, b, tolerance) in enumerate(self.segment_colors, start=1):
@@ -399,7 +498,7 @@ class ADBController(QWidget):
                         if self.video_player.current_segment != segment_num:
                             self.video_player.jump_to_segment = segment_num
                             self.status_label.setText(
-                                f"狀態: 🎯 匹配片段 {segment_num} RGB({r},{g},{b})"
+                                f"狀態: 🎯 匹配片段 {segment_num} RGB({r},{g},{b}) | 當前色 RGB({current_r},{current_g},{current_b})"
                             )
                     break
 
@@ -415,11 +514,8 @@ class ADBController(QWidget):
         if self.video_player:
             self.video_player.stop_playing()
         
-        self.color_detection_active = False
-        if hasattr(self, 'detection_timer'):
-            self.detection_timer.stop()
-        
-        self.status_label.setText("狀態: ⏹ 已停止")
+        self.stop_detection()
+        self.status_label.setText("狀態: ⏹ 已全部停止")
 
     def closeEvent(self, event):
         self.color_timer.stop()
