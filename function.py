@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
-    QFileDialog, QSpinBox, QGroupBox, QScrollArea, QMessageBox
+    QFileDialog, QSpinBox, QGroupBox, QScrollArea, QMessageBox, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtGui import QColor
@@ -235,13 +235,14 @@ class ADBController(QWidget):
         self.color_detection_active = False
         self.video_path: Optional[str] = None
         self.segment_input_widgets = []
+        self.root_mode = False  # ROOT 模式標記
         
         self.initUI()
     
     def initUI(self):
         """初始化 UI"""
         self.setWindowTitle('ADB 控制面板 + 顏色影片控制')
-        self.setGeometry(100, 100, 700, 800)
+        self.setGeometry(100, 100, 700, 850)
         
         main_layout = QVBoxLayout()
         
@@ -276,21 +277,58 @@ class ADBController(QWidget):
     def _create_adb_controls(self) -> QGroupBox:
         """創建 ADB 控制區"""
         group = QGroupBox("ADB 控制")
-        layout = QHBoxLayout()
+        main_layout = QVBoxLayout()
         
-        buttons = [
+        # ROOT 模式切換
+        root_layout = QHBoxLayout()
+        self.root_mode_checkbox = QCheckBox("🔓 ROOT 模式")
+        self.root_mode_checkbox.setStyleSheet("font-weight: bold; color: #ff6600;")
+        self.root_mode_checkbox.stateChanged.connect(self._on_root_mode_changed)
+        root_layout.addWidget(self.root_mode_checkbox)
+        
+        self.root_status_label = QLabel("(未啟用)")
+        self.root_status_label.setStyleSheet("color: #666;")
+        root_layout.addWidget(self.root_status_label)
+        
+        btn_check_root = QPushButton("檢查 ROOT")
+        btn_check_root.clicked.connect(self.check_root_access)
+        root_layout.addWidget(btn_check_root)
+        
+        root_layout.addStretch()
+        main_layout.addLayout(root_layout)
+        
+        # 第一行：基本控制
+        row1 = QHBoxLayout()
+        buttons_row1 = [
             ('返回', self.adb_back),
             ('主畫面', self.adb_home),
             ('截圖', self.adb_screenshot),
             ('啟動 scrcpy', self.start_screen_stream)
         ]
         
-        for text, callback in buttons:
+        for text, callback in buttons_row1:
             btn = QPushButton(text)
             btn.clicked.connect(callback)
-            layout.addWidget(btn)
+            row1.addWidget(btn)
         
-        group.setLayout(layout)
+        # 第二行：網路共享控制
+        row2 = QHBoxLayout()
+        buttons_row2 = [
+            ('📶 開啟熱點', self.adb_enable_hotspot),
+            ('📵 關閉熱點', self.adb_disable_hotspot),
+            ('🔌 開啟 USB 共享', self.adb_enable_usb_tethering),
+            ('🔇 關閉 USB 共享', self.adb_disable_usb_tethering),
+            ('📊 共享狀態', self.adb_check_tethering)
+        ]
+        
+        for text, callback in buttons_row2:
+            btn = QPushButton(text)
+            btn.clicked.connect(callback)
+            row2.addWidget(btn)
+        
+        main_layout.addLayout(row1)
+        main_layout.addLayout(row2)
+        group.setLayout(main_layout)
         return group
     
     def _create_color_display(self) -> QGroupBox:
@@ -552,6 +590,230 @@ class ADBController(QWidget):
             self.status_label.setText("狀態: scrcpy 已啟動")
         except Exception as e:
             QMessageBox.warning(self, "錯誤", f"啟動失敗: {e}")
+    
+    def check_root_access(self):
+        """檢查 ROOT 權限"""
+        try:
+            result = subprocess.run(
+                'adb shell su -c "id"',
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                encoding='utf-8'
+            )
+            
+            if result.returncode == 0 and 'uid=0' in result.stdout:
+                QMessageBox.information(
+                    self,
+                    "ROOT 檢查",
+                    "✅ ROOT 權限可用！\n\n" +
+                    f"輸出: {result.stdout.strip()}\n\n" +
+                    "現在可以啟用 ROOT 模式來使用完全自動化功能"
+                )
+                self.root_status_label.setText("(ROOT 可用)")
+                self.root_status_label.setStyleSheet("color: #00aa00; font-weight: bold;")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "ROOT 檢查",
+                    "❌ ROOT 權限不可用\n\n" +
+                    "可能原因：\n" +
+                    "1. 設備未 ROOT\n" +
+                    "2. SuperSU/Magisk 未授權 ADB\n" +
+                    "3. ROOT 權限已被拒絕\n\n" +
+                    f"錯誤: {result.stderr}"
+                )
+                self.root_status_label.setText("(ROOT 不可用)")
+                self.root_status_label.setStyleSheet("color: #ff0000;")
+                
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, "錯誤", "檢查 ROOT 權限逾時")
+        except Exception as e:
+            QMessageBox.warning(self, "錯誤", f"無法檢查 ROOT: {e}")
+    
+    def _on_root_mode_changed(self, state):
+        """ROOT 模式切換"""
+        self.root_mode = (state == Qt.Checked)
+        
+        if self.root_mode:
+            # 先檢查 ROOT 權限
+            try:
+                result = subprocess.run(
+                    'adb shell su -c "id"',
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    encoding='utf-8'
+                )
+                
+                if result.returncode == 0 and 'uid=0' in result.stdout:
+                    self.root_status_label.setText("(ROOT 模式啟用)")
+                    self.root_status_label.setStyleSheet("color: #00aa00; font-weight: bold;")
+                    self.status_label.setText("狀態: 🔓 ROOT 模式已啟用")
+                else:
+                    self.root_mode_checkbox.setChecked(False)
+                    self.root_mode = False
+                    QMessageBox.warning(
+                        self,
+                        "ROOT 不可用",
+                        "無法啟用 ROOT 模式\n\n請確保設備已 ROOT 並授權 ADB"
+                    )
+            except:
+                self.root_mode_checkbox.setChecked(False)
+                self.root_mode = False
+                QMessageBox.warning(self, "錯誤", "無法檢查 ROOT 權限")
+        else:
+            self.root_status_label.setText("(未啟用)")
+            self.root_status_label.setStyleSheet("color: #666;")
+            self.status_label.setText("狀態: ROOT 模式已關閉")
+    
+    def adb_root_command(self, command: str):
+        """執行 ROOT ADB 指令"""
+        if self.root_mode:
+            return self.adb_command(f'adb shell su -c "{command}"')
+        else:
+            return self.adb_command(f'adb shell {command}')
+    
+    def adb_enable_hotspot(self):
+        """開啟 WiFi 熱點（網路共享）"""
+        if self.root_mode:
+            # ROOT 模式：完全自動化
+            try:
+                # 方法 1: 使用 settings 命令
+                self.adb_root_command('settings put global wifi_ap_state 13')
+                
+                # 方法 2: 使用 svc 命令
+                self.adb_root_command('svc wifi enable')
+                
+                # 方法 3: 使用 cmd 命令 (Android 11+)
+                self.adb_command('adb shell cmd connectivity tether wifi on')
+                
+                self.status_label.setText("狀態: 📶 ROOT 模式 - 熱點已自動開啟")
+                
+                QMessageBox.information(
+                    self,
+                    "WiFi 熱點",
+                    "✅ ROOT 模式啟用成功！\n\n" +
+                    "已使用 ROOT 權限自動開啟熱點"
+                )
+            except Exception as e:
+                QMessageBox.warning(self, "錯誤", f"ROOT 開啟失敗: {e}")
+        else:
+            # 非 ROOT 模式：開啟設定頁面
+            self.adb_command('adb shell am start -n com.android.settings/.TetherSettings')
+            self.status_label.setText("狀態: 📶 已開啟熱點設定頁面")
+            
+            QMessageBox.information(
+                self, 
+                "WiFi 熱點", 
+                "已開啟熱點設定頁面\n\n" +
+                "💡 提示：啟用 ROOT 模式可以自動開啟熱點\n\n" +
+                "由於 Android 安全限制，非 ROOT 模式需要手動啟用"
+            )
+    
+    def adb_disable_hotspot(self):
+        """關閉 WiFi 熱點"""
+        if self.root_mode:
+            # ROOT 模式：完全自動化
+            self.adb_root_command('settings put global wifi_ap_state 11')
+            self.adb_command('adb shell cmd connectivity tether wifi off')
+            self.status_label.setText("狀態: 📵 ROOT 模式 - 熱點已關閉")
+        else:
+            # 非 ROOT 模式
+            self.adb_command('adb shell cmd connectivity tether wifi off')
+            self.status_label.setText("狀態: 📵 已嘗試關閉熱點")
+    
+    def adb_enable_usb_tethering(self):
+        """開啟 USB 網路共享"""
+        try:
+            if self.root_mode:
+                # ROOT 模式：更可靠的方法
+                self.adb_root_command('setprop sys.usb.config rndis,adb')
+                self.adb_command('adb shell cmd connectivity tether usb on')
+                self.status_label.setText("狀態: 🔌 ROOT 模式 - USB 網路共享已開啟")
+                
+                QMessageBox.information(
+                    self,
+                    "USB 網路共享",
+                    "✅ ROOT 模式啟用成功！\n\n" +
+                    "USB 網路共享已自動開啟"
+                )
+            else:
+                # 非 ROOT 模式
+                self.adb_command('adb shell cmd connectivity tether usb on')
+                self.status_label.setText("狀態: 🔌 已開啟 USB 網路共享")
+                
+                QMessageBox.information(
+                    self,
+                    "USB 網路共享",
+                    "已嘗試開啟 USB 網路共享\n\n" +
+                    "💡 提示：啟用 ROOT 模式可提高成功率\n\n" +
+                    "如果未成功，可能需要：\n" +
+                    "1. ROOT 權限\n" +
+                    "2. 確保 USB 已連接\n" +
+                    "3. 手動到設定中啟用"
+                )
+            
+        except Exception as e:
+            QMessageBox.warning(self, "錯誤", f"開啟失敗: {e}")
+    
+    def adb_disable_usb_tethering(self):
+        """關閉 USB 網路共享"""
+        try:
+            if self.root_mode:
+                self.adb_root_command('setprop sys.usb.config adb')
+            
+            self.adb_command('adb shell cmd connectivity tether usb off')
+            self.status_label.setText("狀態: 🔇 已關閉 USB 網路共享")
+        except Exception as e:
+            QMessageBox.warning(self, "錯誤", f"關閉失敗: {e}")
+    
+    def adb_check_tethering(self):
+        """檢查網路共享狀態"""
+        try:
+            # 檢查 USB 網路共享
+            result_usb = subprocess.run(
+                'adb shell getprop sys.usb.config',
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                encoding='utf-8'
+            )
+            
+            # 檢查熱點狀態
+            result_hotspot = subprocess.run(
+                'adb shell settings get global wifi_ap_state',
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                encoding='utf-8'
+            )
+            
+            # 解析狀態
+            usb_status = "USB 網路共享: " + ("🟢 已啟用" if "rndis" in result_usb.stdout else "🔴 未啟用")
+            
+            hotspot_state = result_hotspot.stdout.strip()
+            hotspot_status = "WiFi 熱點: "
+            if hotspot_state == "13":
+                hotspot_status += "🟢 已啟用"
+            elif hotspot_state == "11":
+                hotspot_status += "🔴 已停用"
+            else:
+                hotspot_status += f"⚪ 狀態 {hotspot_state}"
+            
+            status_msg = f"{usb_status}\n{hotspot_status}"
+            
+            QMessageBox.information(self, "網路共享狀態", status_msg)
+            self.status_label.setText(f"狀態: {usb_status} | {hotspot_status}")
+            
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, "錯誤", "檢查狀態逾時")
+        except Exception as e:
+            QMessageBox.warning(self, "錯誤", f"無法檢查狀態: {e}")
     
     # ==================== 影片控制 ====================
     def load_video(self):
