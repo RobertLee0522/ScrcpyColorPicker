@@ -32,6 +32,7 @@ class SegmentConfig:
     start_frame: int
     end_frame: int
     color: ColorConfig
+    loop: bool = False  # 新增：是否重複播放
 
 
 # ===================== 顏色工具類 =====================
@@ -166,12 +167,20 @@ class VideoSegmentPlayer(QObject):
                 # 檢查是否需要跳到下一段
                 current_segment_config = self.segments[self.current_segment - 1]
                 if current_frame >= current_segment_config.end_frame:
-                    next_segment = (self.current_segment % len(self.segments)) + 1
-                    self.jump_to(next_segment)
+                    # 檢查當前片段是否設置為循環播放
+                    if current_segment_config.loop:
+                        # 循環播放當前片段
+                        self.jump_to(self.current_segment)
+                        print(f"🔁 片段 {self.current_segment} 循環播放")
+                    else:
+                        # 跳到下一段
+                        next_segment = (self.current_segment % len(self.segments)) + 1
+                        self.jump_to(next_segment)
                     continue
                 
                 # 繪製資訊文字
-                text = f"Segment: {self.current_segment}/{len(self.segments)} | Frame: {current_frame}/{self.total_frames}"
+                loop_indicator = " 🔁" if current_segment_config.loop else ""
+                text = f"Segment: {self.current_segment}/{len(self.segments)}{loop_indicator} | Frame: {current_frame}/{self.total_frames}"
                 cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                            0.8, (0, 255, 0), 2, cv2.LINE_AA)
                 
@@ -315,7 +324,7 @@ class ADBController(QWidget):
         row2 = QHBoxLayout()
         buttons_row2 = [
             ('📶 開啟熱點', self.adb_enable_hotspot),
-            ('📵 關閉熱點', self.adb_disable_hotspot),
+            ('🔵 關閉熱點', self.adb_disable_hotspot),
             ('🔌 開啟 USB 共享', self.adb_enable_usb_tethering),
             ('🔇 關閉 USB 共享', self.adb_disable_usb_tethering),
             ('📊 共享狀態', self.adb_check_tethering)
@@ -453,7 +462,8 @@ class ADBController(QWidget):
                 'g': widgets['g'].value(),
                 'b': widgets['b'].value(),
                 'tolerance': widgets['tolerance'].value(),
-                'start_frame': widgets['start_frame'].value()
+                'start_frame': widgets['start_frame'].value(),
+                'loop': widgets['loop'].isChecked()  # 新增：儲存循環設定
             })
         
         # 清除舊的輸入欄位
@@ -520,8 +530,18 @@ class ADBController(QWidget):
             row2.addWidget(QLabel(f"(建議: {i * frames_per_segment})"))
             row2.addStretch()
             
+            # 第三行:循環播放選項 (新增)
+            row3 = QHBoxLayout()
+            loop_checkbox = QCheckBox("🔁 重複播放此片段")
+            loop_checkbox.setStyleSheet("font-weight: bold; color: #0066cc;")
+            if i < len(old_settings):
+                loop_checkbox.setChecked(old_settings[i]['loop'])
+            row3.addWidget(loop_checkbox)
+            row3.addStretch()
+            
             segment_layout.addLayout(row1)
             segment_layout.addLayout(row2)
+            segment_layout.addLayout(row3)
             segment_frame.setLayout(segment_layout)
             
             self.segment_inputs_layout.addWidget(segment_frame)
@@ -532,7 +552,8 @@ class ADBController(QWidget):
                 'g': g_input,
                 'b': b_input,
                 'tolerance': tolerance_input,
-                'start_frame': start_frame_input
+                'start_frame': start_frame_input,
+                'loop': loop_checkbox  # 新增：循環播放選項
             })
     
     def _pick_color_for_segment(self, segment_index: int):
@@ -719,11 +740,11 @@ class ADBController(QWidget):
             # ROOT 模式：完全自動化
             self.adb_root_command('settings put global wifi_ap_state 11')
             self.adb_command('adb shell cmd connectivity tether wifi off')
-            self.status_label.setText("狀態: 📵 ROOT 模式 - 熱點已關閉")
+            self.status_label.setText("狀態: 🔵 ROOT 模式 - 熱點已關閉")
         else:
             # 非 ROOT 模式
             self.adb_command('adb shell cmd connectivity tether wifi off')
-            self.status_label.setText("狀態: 📵 已嘗試關閉熱點")
+            self.status_label.setText("狀態: 🔵 已嘗試關閉熱點")
     
     def adb_enable_usb_tethering(self):
         """開啟 USB 網路共享"""
@@ -903,7 +924,10 @@ class ADBController(QWidget):
                 tolerance=widgets['tolerance'].value()
             )
             
-            segments.append(SegmentConfig(start_frame, end_frame, color))
+            # 新增：取得循環設定
+            loop = widgets['loop'].isChecked()
+            
+            segments.append(SegmentConfig(start_frame, end_frame, color, loop))
         
         return segments
     
@@ -966,8 +990,9 @@ class ADBController(QWidget):
                         if self.video_player.current_segment != segment_num:
                             self.video_player.jump_to_segment = segment_num
                             r, g, b = current_color
+                            loop_text = " 🔁" if config.loop else ""
                             self.status_label.setText(
-                                f"狀態: 🎯 匹配片段 {segment_num} | "
+                                f"狀態: 🎯 匹配片段 {segment_num}{loop_text} | "
                                 f"目標 RGB({config.color.r},{config.color.g},{config.color.b}) | "
                                 f"當前 RGB({r},{g},{b})"
                             )
