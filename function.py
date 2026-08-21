@@ -12,8 +12,8 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
     QFileDialog, QSpinBox, QGroupBox, QScrollArea, QMessageBox, QCheckBox
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect
+from PyQt5.QtGui import QColor, QPainter, QPen
 
 
 # ===================== 資料類別 =====================
@@ -54,8 +54,26 @@ class ColorUtils:
             return None
     
     @staticmethod
-    def is_color_match(color1: Tuple[int, int, int], 
-                       color2: Tuple[int, int, int], 
+    def get_region_average_color(x: int, y: int, width: int, height: int) -> Optional[Tuple[int, int, int]]:
+        """獲取螢幕指定矩形區域的平均 RGB 顏色"""
+        try:
+            with mss.mss() as sct:
+                monitor = {
+                    "top": int(y), "left": int(x),
+                    "width": max(1, int(width)), "height": max(1, int(height))
+                }
+                img = np.array(sct.grab(monitor))
+                # mss 返回 BGRA 格式,取平均後轉換為 RGB
+                avg = img[:, :, :3].mean(axis=(0, 1))
+                b, g, r = avg
+                return (int(round(r)), int(round(g)), int(round(b)))
+        except Exception as e:
+            print(f"獲取區域顏色失敗: {e}")
+            return None
+
+    @staticmethod
+    def is_color_match(color1: Tuple[int, int, int],
+                       color2: Tuple[int, int, int],
                        tolerance: int) -> bool:
         """判斷兩個顏色是否匹配"""
         r1, g1, b1 = color1
@@ -235,6 +253,206 @@ class ColorPicker:
         self.listener.start()
 
 
+# ===================== 偵測框選取覆蓋層 =====================
+class RegionSelectorOverlay(QWidget):
+    """全螢幕半透明遮罩，讓使用者拖曳建立/移動/縮放一個矩形偵測框。
+
+    操作方式：
+      - 在空白處拖曳：畫出新的偵測框
+      - 在框內按住拖曳：移動整個框
+      - 在框的邊角/邊線按住拖曳：縮放框
+      - 雙擊框內 或 按 Enter：確認選取
+      - 按 Esc：取消
+    """
+
+    region_confirmed = pyqtSignal(int, int, int, int)  # x, y, w, h (螢幕座標)
+    selection_cancelled = pyqtSignal()
+
+    HANDLE_SIZE = 12
+
+    def __init__(self, initial_rect: Optional[Tuple[int, int, int, int]] = None):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+
+        # 涵蓋所有螢幕的虛擬桌面範圍，支援多螢幕環境
+        virtual_geo = QRect()
+        for screen in QApplication.screens():
+            virtual_geo = virtual_geo.united(screen.geometry())
+        self._origin = virtual_geo.topLeft()
+        self.setGeometry(virtual_geo)
+
+        self.selection_rect: Optional[QRect] = None
+        if initial_rect:
+            x, y, w, h = initial_rect
+            self.selection_rect = QRect(x - self._origin.x(), y - self._origin.y(), w, h)
+
+        self._mode: Optional[str] = None  # None | 'draw' | 'move' | 'resize'
+        self._resize_handle: Optional[str] = None
+        self._drag_start = None
+        self._rect_start: Optional[QRect] = None
+
+    # ---------- 控制點計算 ----------
+    def _handles(self) -> dict:
+        if not self.selection_rect:
+            return {}
+        r = self.selection_rect
+        hs = self.HANDLE_SIZE
+        return {
+            'top_left': QRect(r.left() - hs // 2, r.top() - hs // 2, hs, hs),
+            'top_right': QRect(r.right() - hs // 2, r.top() - hs // 2, hs, hs),
+            'bottom_left': QRect(r.left() - hs // 2, r.bottom() - hs // 2, hs, hs),
+            'bottom_right': QRect(r.right() - hs // 2, r.bottom() - hs // 2, hs, hs),
+            'top': QRect(r.center().x() - hs // 2, r.top() - hs // 2, hs, hs),
+            'bottom': QRect(r.center().x() - hs // 2, r.bottom() - hs // 2, hs, hs),
+            'left': QRect(r.left() - hs // 2, r.center().y() - hs // 2, hs, hs),
+            'right': QRect(r.right() - hs // 2, r.center().y() - hs // 2, hs, hs),
+        }
+
+    def _handle_at(self, pos) -> Optional[str]:
+        for name, handle_rect in self._handles().items():
+            if handle_rect.contains(pos):
+                return name
+        return None
+
+    @staticmethod
+    def _cursor_for_handle(handle: str):
+        mapping = {
+            'top_left': Qt.SizeFDiagCursor, 'bottom_right': Qt.SizeFDiagCursor,
+            'top_right': Qt.SizeBDiagCursor, 'bottom_left': Qt.SizeBDiagCursor,
+            'top': Qt.SizeVerCursor, 'bottom': Qt.SizeVerCursor,
+            'left': Qt.SizeHorCursor, 'right': Qt.SizeHorCursor,
+        }
+        return mapping.get(handle, Qt.ArrowCursor)
+
+    # ---------- 滑鼠事件 ----------
+    def mousePressEvent(self, event):
+        pos = event.pos()
+
+        if self.selection_rect:
+            handle = self._handle_at(pos)
+            if handle:
+                self._mode = 'resize'
+                self._resize_handle = handle
+                self._rect_start = QRect(self.selection_rect)
+                self._drag_start = pos
+                return
+
+            if self.selection_rect.contains(pos):
+                self._mode = 'move'
+                self._rect_start = QRect(self.selection_rect)
+                self._drag_start = pos
+                self.setCursor(Qt.ClosedHandCursor)
+                return
+
+        # 點在框外（或尚未有框）：開始畫一個新的偵測框
+        self._mode = 'draw'
+        self._drag_start = pos
+        self.selection_rect = QRect(pos, pos)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.pos()
+
+        if self._mode == 'draw':
+            self.selection_rect = QRect(self._drag_start, pos).normalized()
+        elif self._mode == 'move':
+            delta = pos - self._drag_start
+            new_rect = QRect(self._rect_start)
+            new_rect.translate(delta)
+            self.selection_rect = new_rect
+        elif self._mode == 'resize':
+            self._apply_resize(pos)
+        else:
+            if self.selection_rect:
+                handle = self._handle_at(pos)
+                if handle:
+                    self.setCursor(self._cursor_for_handle(handle))
+                elif self.selection_rect.contains(pos):
+                    self.setCursor(Qt.OpenHandCursor)
+                else:
+                    self.setCursor(Qt.CrossCursor)
+
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._mode == 'move' and self.selection_rect:
+            self.setCursor(Qt.OpenHandCursor)
+        self._mode = None
+        self._resize_handle = None
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if self.selection_rect and self.selection_rect.contains(event.pos()):
+            self._confirm()
+
+    def _apply_resize(self, pos):
+        r = QRect(self._rect_start)
+        handle = self._resize_handle or ''
+        if 'left' in handle:
+            r.setLeft(pos.x())
+        if 'right' in handle:
+            r.setRight(pos.x())
+        if 'top' in handle:
+            r.setTop(pos.y())
+        if 'bottom' in handle:
+            r.setBottom(pos.y())
+        self.selection_rect = r.normalized()
+
+    # ---------- 鍵盤事件 ----------
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._confirm()
+        elif event.key() == Qt.Key_Escape:
+            self.selection_cancelled.emit()
+            self.close()
+
+    def _confirm(self):
+        if self.selection_rect and self.selection_rect.width() > 2 and self.selection_rect.height() > 2:
+            x = self.selection_rect.x() + self._origin.x()
+            y = self.selection_rect.y() + self._origin.y()
+            self.region_confirmed.emit(x, y, self.selection_rect.width(), self.selection_rect.height())
+        else:
+            self.selection_cancelled.emit()
+        self.close()
+
+    # ---------- 繪製 ----------
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # 半透明黑色遮罩覆蓋整個畫面
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
+
+        if self.selection_rect:
+            # 挖空偵測框範圍，讓底下實際畫面清楚顯示
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.fillRect(self.selection_rect, Qt.transparent)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+            # 框線
+            painter.setPen(QPen(QColor(0, 220, 90), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self.selection_rect)
+
+            # 縮放控制點
+            painter.setBrush(QColor(0, 220, 90))
+            for handle_rect in self._handles().values():
+                painter.drawRect(handle_rect)
+
+            # 尺寸標示
+            painter.setPen(QColor(255, 255, 255))
+            size_text = f"{self.selection_rect.width()} x {self.selection_rect.height()}"
+            painter.drawText(self.selection_rect.left(), max(15, self.selection_rect.top() - 8), size_text)
+
+        # 操作提示
+        painter.setPen(QColor(255, 255, 255))
+        hint = "拖曳建立偵測框 | 框內拖曳＝移動 | 邊角拖曳＝縮放 | 雙擊或 Enter＝確認 | Esc＝取消"
+        painter.drawText(20, 30, hint)
+
+
 # ===================== 主控制面板 =====================
 class ADBController(QWidget):
     def __init__(self):
@@ -245,28 +463,36 @@ class ADBController(QWidget):
         self.video_path: Optional[str] = None
         self.segment_input_widgets = []
         self.root_mode = False  # ROOT 模式標記
-        
+        self.detection_region: Optional[Tuple[int, int, int, int]] = None  # 偵測框 (x, y, w, h)
+        self._region_selector: Optional[RegionSelectorOverlay] = None
+
         self.initUI()
-    
+
     def initUI(self):
         """初始化 UI"""
         self.setWindowTitle('ADB 控制面板 + 顏色影片控制')
-        self.setGeometry(100, 100, 700, 850)
-        
+        self.setGeometry(100, 100, 700, 1000)
+
         main_layout = QVBoxLayout()
-        
+
         # ADB 控制區
         main_layout.addWidget(self._create_adb_controls())
-        
+
         # 即時取色顯示
         main_layout.addWidget(self._create_color_display())
-        
+
+        # 偵測框設定區（可拖曳調整的取樣範圍）
+        main_layout.addWidget(self._create_detection_region_settings())
+
         # 影片設定區
         main_layout.addWidget(self._create_video_settings())
-        
+
         # 片段顏色設定區
         main_layout.addWidget(self._create_segment_color_settings())
-        
+
+        # 目前顏色比對狀態（即時顯示屬於哪個片段）
+        main_layout.addWidget(self._create_match_indicator())
+
         # 控制按鈕
         main_layout.addLayout(self._create_control_buttons())
         
@@ -352,7 +578,55 @@ class ADBController(QWidget):
         
         group.setLayout(layout)
         return group
-    
+
+    def _create_detection_region_settings(self) -> QGroupBox:
+        """創建偵測框設定區（可拖曳調整的取樣範圍）"""
+        group = QGroupBox("🎯 偵測框設定（取代單點滑鼠取色，可拖曳調整範圍）")
+        layout = QVBoxLayout()
+
+        btn_row = QHBoxLayout()
+        btn_set_region = QPushButton('🖱 設定 / 調整偵測框')
+        btn_set_region.setStyleSheet("padding: 8px; font-size: 13px;")
+        btn_set_region.clicked.connect(self._open_region_selector)
+        btn_row.addWidget(btn_set_region)
+
+        btn_clear_region = QPushButton('🗑 清除偵測框')
+        btn_clear_region.clicked.connect(self._clear_detection_region)
+        btn_row.addWidget(btn_clear_region)
+        layout.addLayout(btn_row)
+
+        self.region_info_label = QLabel("尚未設定偵測框（目前以滑鼠位置的顏色作為判斷依據）")
+        self.region_info_label.setStyleSheet("padding: 5px; color: #666;")
+        self.region_info_label.setWordWrap(True)
+        layout.addWidget(self.region_info_label)
+
+        self.region_color_label = QLabel("偵測框顏色: RGB(---, ---, ---)")
+        self.region_color_label.setAlignment(Qt.AlignCenter)
+        self.region_color_label.setStyleSheet(
+            "font-size: 14px; padding: 10px; background-color: #f0f0f0; border-radius: 5px;"
+        )
+        layout.addWidget(self.region_color_label)
+
+        group.setLayout(layout)
+        return group
+
+    def _create_match_indicator(self) -> QGroupBox:
+        """創建『目前顏色屬於哪個片段』的即時比對狀態區"""
+        self.match_indicator_group = QGroupBox("目前顏色屬於哪個片段？（即時更新，非偵測中也會顯示）")
+        layout = QVBoxLayout()
+
+        self.match_chips_layout = QHBoxLayout()
+        layout.addLayout(self.match_chips_layout)
+
+        self.match_status_label = QLabel("⚪ 尚無比對資料")
+        self.match_status_label.setAlignment(Qt.AlignCenter)
+        self.match_status_label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 8px; color: #666;")
+        layout.addWidget(self.match_status_label)
+
+        self.match_indicator_group.setLayout(layout)
+        self._rebuild_match_chips()
+        return self.match_indicator_group
+
     def _create_video_settings(self) -> QGroupBox:
         """創建影片設定區"""
         group = QGroupBox("影片設定")
@@ -435,22 +709,137 @@ class ADBController(QWidget):
         return layout
     
     def _update_mouse_color(self):
-        """更新滑鼠位置顏色顯示"""
+        """更新滑鼠位置顏色顯示、偵測框顏色，以及目前顏色的片段比對狀態"""
         try:
             x, y = pyautogui.position()
-            color = ColorUtils.get_screen_color(x, y)
-            
-            if color:
-                r, g, b = color
+            mouse_color = ColorUtils.get_screen_color(x, y)
+
+            if mouse_color:
+                r, g, b = mouse_color
                 text_color = ColorUtils.get_contrast_color(r, g, b)
-                
+
                 self.color_label.setText(f"滑鼠位置 ({x}, {y}) 顏色: RGB({r}, {g}, {b})")
                 self.color_label.setStyleSheet(
                     f"font-size: 16px; padding: 15px; background-color: rgb({r},{g},{b}); "
                     f"color: {text_color}; border-radius: 5px;"
                 )
+
+            # 若已設定偵測框，改用偵測框內的平均顏色作為判斷依據
+            current_color = mouse_color
+            if self.detection_region:
+                rx, ry, rw, rh = self.detection_region
+                region_color = ColorUtils.get_region_average_color(rx, ry, rw, rh)
+                if region_color:
+                    current_color = region_color
+                    rr, rg, rb = region_color
+                    region_text_color = ColorUtils.get_contrast_color(rr, rg, rb)
+                    self.region_color_label.setText(f"偵測框顏色: RGB({rr}, {rg}, {rb})")
+                    self.region_color_label.setStyleSheet(
+                        f"font-size: 14px; padding: 10px; background-color: rgb({rr},{rg},{rb}); "
+                        f"color: {region_text_color}; border-radius: 5px;"
+                    )
+
+            self._update_match_indicator(current_color)
         except Exception as e:
             pass
+
+    def _get_live_segment_colors(self) -> List[ColorConfig]:
+        """直接從目前輸入欄位讀取每個片段的顏色設定，不需要先載入影片"""
+        return [
+            ColorConfig(
+                r=widgets['r'].value(),
+                g=widgets['g'].value(),
+                b=widgets['b'].value(),
+                tolerance=widgets['tolerance'].value()
+            )
+            for widgets in self.segment_input_widgets
+        ]
+
+    def _find_matching_segment(self, current_color: Tuple[int, int, int],
+                                colors: List[ColorConfig]) -> Optional[int]:
+        """回傳目前顏色符合的片段編號（1-based），找不到則回傳 None"""
+        for idx, color in enumerate(colors, start=1):
+            if ColorUtils.is_color_match(current_color, (color.r, color.g, color.b), color.tolerance):
+                return idx
+        return None
+
+    def _update_match_indicator(self, current_color: Optional[Tuple[int, int, int]]):
+        """即時更新『目前顏色屬於哪個片段』的顯示，讓結果一目了然"""
+        if not hasattr(self, 'segment_chip_widgets'):
+            return
+
+        colors = self._get_live_segment_colors()
+        matched = self._find_matching_segment(current_color, colors) if current_color else None
+
+        for i, chip in enumerate(self.segment_chip_widgets, start=1):
+            if i - 1 < len(colors):
+                c = colors[i - 1]
+                bg = f"rgb({c.r},{c.g},{c.b})"
+                text_color = ColorUtils.get_contrast_color(c.r, c.g, c.b)
+            else:
+                bg = "#cccccc"
+                text_color = "black"
+
+            border = "4px solid #00cc44" if matched == i else "2px solid #999999"
+            chip.setStyleSheet(
+                f"background-color: {bg}; color: {text_color}; "
+                f"border: {border}; border-radius: 6px; font-weight: bold;"
+            )
+
+        if current_color is None:
+            self.match_status_label.setText("⚪ 尚無比對資料")
+            self.match_status_label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 8px; color: #666;")
+        elif matched:
+            loop_text = ""
+            if matched - 1 < len(self.segment_input_widgets):
+                loop_text = " 🔁" if self.segment_input_widgets[matched - 1]['loop'].isChecked() else ""
+            self.match_status_label.setText(f"🎯 目前顏色 RGB{current_color} 屬於：片段 {matched}{loop_text}")
+            self.match_status_label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 8px; color: #00aa00;")
+        else:
+            self.match_status_label.setText(f"⚪ 目前顏色 RGB{current_color} 未匹配任何片段")
+            self.match_status_label.setStyleSheet("font-size: 15px; font-weight: bold; padding: 8px; color: #cc6600;")
+
+    # ==================== 偵測框（可拖曳的取樣範圍） ====================
+    def _open_region_selector(self):
+        """開啟偵測框選取覆蓋層，可拖曳建立/移動/縮放偵測框"""
+        self.status_label.setText(
+            "狀態: 🖱 請在螢幕上拖曳出偵測框（框內拖曳可移動、邊角拖曳可縮放，雙擊或 Enter 確認、Esc 取消）"
+        )
+        self._region_selector = RegionSelectorOverlay(self.detection_region)
+        self._region_selector.region_confirmed.connect(self._on_region_confirmed)
+        self._region_selector.selection_cancelled.connect(self._on_region_cancelled)
+        self._region_selector.show()
+        self._region_selector.activateWindow()
+
+    def _on_region_confirmed(self, x: int, y: int, w: int, h: int):
+        """偵測框確認後的回調"""
+        self.detection_region = (x, y, w, h)
+        self.region_info_label.setText(
+            f"✅ 偵測框: 位置 ({x}, {y})　大小 {w} x {h}（可再次點擊按鈕拖曳調整）"
+        )
+        self.status_label.setText("狀態: ✅ 偵測框已設定")
+
+    def _on_region_cancelled(self):
+        """偵測框選取被取消時的回調"""
+        self.status_label.setText("狀態: 已取消設定偵測框")
+
+    def _clear_detection_region(self):
+        """清除偵測框，改回使用滑鼠位置顏色"""
+        self.detection_region = None
+        self.region_info_label.setText("尚未設定偵測框（目前以滑鼠位置的顏色作為判斷依據）")
+        self.region_color_label.setText("偵測框顏色: RGB(---, ---, ---)")
+        self.region_color_label.setStyleSheet(
+            "font-size: 14px; padding: 10px; background-color: #f0f0f0; border-radius: 5px;"
+        )
+        self.status_label.setText("狀態: 已清除偵測框")
+
+    def _get_current_detection_color(self) -> Optional[Tuple[int, int, int]]:
+        """取得目前用於偵測的顏色：優先使用偵測框平均色，否則退回滑鼠位置顏色"""
+        if self.detection_region:
+            x, y, w, h = self.detection_region
+            return ColorUtils.get_region_average_color(x, y, w, h)
+        x, y = pyautogui.position()
+        return ColorUtils.get_screen_color(x, y)
     
     def _update_segment_inputs(self):
         """更新片段輸入欄位"""
@@ -555,7 +944,34 @@ class ADBController(QWidget):
                 'start_frame': start_frame_input,
                 'loop': loop_checkbox  # 新增：循環播放選項
             })
-    
+
+        # 同步更新『目前顏色屬於哪個片段』的比對區塊（片段數量可能已變動）
+        if hasattr(self, 'match_chips_layout'):
+            self._rebuild_match_chips()
+
+    def _rebuild_match_chips(self):
+        """重建片段比對指示燈（chip），數量與片段數保持一致"""
+        while self.match_chips_layout.count():
+            item = self.match_chips_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self.segment_chip_widgets = []
+        num_segments = self.segment_spinbox.value() if hasattr(self, 'segment_spinbox') else 0
+
+        for i in range(num_segments):
+            chip = QLabel(str(i + 1))
+            chip.setAlignment(Qt.AlignCenter)
+            chip.setFixedSize(40, 40)
+            chip.setStyleSheet(
+                "background-color: #cccccc; color: black; "
+                "border: 2px solid #999999; border-radius: 6px; font-weight: bold;"
+            )
+            self.match_chips_layout.addWidget(chip)
+            self.segment_chip_widgets.append(chip)
+
+        self.match_chips_layout.addStretch()
+
     def _pick_color_for_segment(self, segment_index: int):
         """為指定片段擷取顏色"""
         self.status_label.setText(f"狀態: 🖱 請點擊螢幕任一位置以擷取顏色 (片段 {segment_index + 1})...")
@@ -968,36 +1384,32 @@ class ADBController(QWidget):
         self.status_label.setText("狀態: ⏸ 偵測已停止")
     
     def _check_color_and_control(self):
-        """檢查顏色並控制影片"""
+        """檢查顏色並控制影片（優先使用偵測框平均色，否則退回滑鼠位置顏色）"""
         if not self.color_detection_active:
             return
-        
+
         try:
-            x, y = pyautogui.position()
-            current_color = ColorUtils.get_screen_color(x, y)
-            
+            current_color = self._get_current_detection_color()
+
             if not current_color:
                 return
-            
-            # 檢查每個片段的顏色
-            for segment_num, config in enumerate(self.segment_configs, start=1):
-                if ColorUtils.is_color_match(
-                    current_color,
-                    (config.color.r, config.color.g, config.color.b),
-                    config.color.tolerance
-                ):
-                    if self.video_player and self.video_player.playing:
-                        if self.video_player.current_segment != segment_num:
-                            self.video_player.jump_to_segment = segment_num
-                            r, g, b = current_color
-                            loop_text = " 🔁" if config.loop else ""
-                            self.status_label.setText(
-                                f"狀態: 🎯 匹配片段 {segment_num}{loop_text} | "
-                                f"目標 RGB({config.color.r},{config.color.g},{config.color.b}) | "
-                                f"當前 RGB({r},{g},{b})"
-                            )
-                    break
-        
+
+            segment_num = self._find_matching_segment(
+                current_color, [config.color for config in self.segment_configs]
+            )
+
+            if segment_num and self.video_player and self.video_player.playing:
+                if self.video_player.current_segment != segment_num:
+                    config = self.segment_configs[segment_num - 1]
+                    self.video_player.jump_to_segment = segment_num
+                    r, g, b = current_color
+                    loop_text = " 🔁" if config.loop else ""
+                    self.status_label.setText(
+                        f"狀態: 🎯 匹配片段 {segment_num}{loop_text} | "
+                        f"目標 RGB({config.color.r},{config.color.g},{config.color.b}) | "
+                        f"當前 RGB({r},{g},{b})"
+                    )
+
         except Exception as e:
             pass
     
